@@ -157,11 +157,11 @@ void wifi_hardware_reset () {
     Serial1X.end();
 
     digitalWrite( LDO33_ENABLE, LOW );
-    delay( 1000 );
+    wait();
     digitalWrite( LDO33_ENABLE, HIGH );
 
     // wait til gs wakes up
-    delay( 1000 );
+    wait();
 
     ring_put( &commands, COMMAND_SETUP );
 }
@@ -207,7 +207,12 @@ void process_commands() {
 }
 
 void on_irkit_ready() {
-    color.setLedColor( 0, 0, 1, false ); // blue: ready
+    color.setLedColor( 0, 0, 0, false );
+    // color.setLedColor( 0, 0, 1, false ); // blue: ready
+}
+
+void wait() {
+  delay( 1000 );
 }
 
 void on_ir_receive() {
@@ -224,20 +229,17 @@ void on_ir_receive() {
 void on_ir_xmit() {
     MAINLOG_PRINTLN("i>");
     color.setLedColor( 0, 0, 1, true, 1 ); // xmit: blue blink for 1sec
+    wait();
+    on_irkit_ready();
 }
 
 // inside ISR, be careful
 void on_timer() {
     color.onTimer(); // 200msec blink
-
     irkit_http_on_timer();
-
     TIMER_TICK( reconnect_timer );
-
     gs.onTimer();
-
     IR_timer();
-
     long_press_button_ontimer( &long_press_button_state );
 }
 
