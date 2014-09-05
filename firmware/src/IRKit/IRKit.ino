@@ -223,6 +223,8 @@ void on_ir_receive() {
     if (IR_packedlength() > 0) {
         color.setLedColor( 0, 0, 1, true, 1 ); // received: blue blink for 1sec
         irkit_httpclient_post_messages();
+        wait();
+        on_irkit_ready();
     }
 }
 
