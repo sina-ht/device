@@ -44,6 +44,7 @@ static volatile uint8_t polling_timer         = TIMER_OFF;
 static uint32_t newest_message_id = 0; // on memory only should be fine
 static int8_t post_keys_cid;
 static int8_t polling_cid = CID_UNDEFINED; // GET /m continues forever
+static bool is_posting_message = false;
 
 #define POST_DOOR_BODY_LENGTH 61
 #define POST_KEYS_BODY_LENGTH 42
@@ -118,7 +119,6 @@ static int8_t on_post_door_response(int8_t cid, uint16_t status_code, GSwifi::GS
 
         break;
     case 401:
-    case HTTP_STATUSCODE_CLIENT_TIMEOUT:
         // keys have expired, we have to start listening for POST /wifi again
         keys.clear();
         keys.save();
@@ -171,12 +171,6 @@ static int8_t on_get_messages_response(int8_t cid, uint16_t status_code, GSwifi:
             // there's already an ongoing polling request, so request again when that one finishes
         }
         break;
-    case HTTP_STATUSCODE_CLIENT_TIMEOUT:
-        polling_cid = CID_UNDEFINED;
-        ring_put( &commands, COMMAND_CLOSE );
-        ring_put( &commands, cid );
-        irkit_httpclient_start_polling( 5 );
-        break;
     case HTTP_STATUSCODE_DISCONNECT:
         polling_cid = CID_UNDEFINED;
         irkit_httpclient_start_polling( 5 );
@@ -186,6 +180,7 @@ static int8_t on_get_messages_response(int8_t cid, uint16_t status_code, GSwifi:
     case 503:
     default:
         if (state == GSwifi::GSREQUESTSTATE_RECEIVED) {
+            polling_cid = CID_UNDEFINED;
             ring_put( &commands, COMMAND_CLOSE );
             ring_put( &commands, cid );
             irkit_httpclient_start_polling( 5 );
@@ -235,11 +230,13 @@ static int8_t on_post_keys_response(int8_t cid, uint16_t status_code, GSwifi::GS
 }
 
 static int8_t on_post_messages_response(int8_t cid, uint16_t status_code, GSwifi::GSREQUESTSTATE state) {
-    HTTPLOG_PRINT(P("< P /m ")); HTTPLOG_PRINTLN(status_code);
+    HTTPLOG_PRINT(P("< P /p ")); HTTPLOG_PRINTLN(status_code);
 
     if (status_code != 200) {
         gs.bufferClear();
     }
+
+    is_posting_message = false;
 
     if (state != GSwifi::GSREQUESTSTATE_RECEIVED) {
         return 0;
@@ -359,7 +356,8 @@ static int8_t on_post_wifi_request(uint8_t cid, GSwifi::GSREQUESTSTATE state) {
         ring_put( &commands, cid );
 
         if (result == 0) {
-            gs.setRegDomain( keys.regdomain );
+            ring_put( &commands, COMMAND_SETREGDOMAIN );
+            ring_put( &commands, keys.regdomain );
             ring_put( &commands, COMMAND_CONNECT );
         }
     }
@@ -396,20 +394,41 @@ int8_t irkit_httpclient_post_door() {
 
 int8_t irkit_httpclient_get_messages() {
     // /m?devicekey=C7363FDA0F06406AB11C29BA41272AE3&newer_than=4294967295
-    char path[70];
+    char path[68];
     sprintf(path, P("/m?devicekey=%s&newer_than=%ld"), keys.getKey(), newest_message_id);
     return gs.get(path, &on_get_messages_response, 50);
 }
 
-int8_t irkit_httpclient_post_messages() {
+int8_t irkit_httpclient_post_messages_() {
     // post body is IR data, move devicekey parameter to query, for implementation simplicity
     // /p?devicekey=C7363FDA0F06406AB11C29BA41272AE3&freq=38
     char path[54];
     sprintf(path, P("/p?devicekey=%s&freq=%d"), keys.getKey(), IrCtrl.freq);
-    return gs.postBinary( path,
-                          (const char*)sharedbuffer, IR_packedlength(),
-                          &on_post_messages_response,
-                          10 );
+    int8_t cid = gs.postBinary( path,
+                                (const char*)sharedbuffer, IR_packedlength(),
+                                &on_post_messages_response,
+                                10 );
+    if (cid == polling_cid) {
+        // we're polling on this cid, and our response handler is registered with this cid.
+        // we already overwritten the response handler, so restart everything.
+        HTTPLOG_PRINTLN("!E30");
+        wifi_hardware_reset();
+        return -1;
+    }
+    return cid;
+}
+
+// stack memory to initiate a HTTP request is not small;
+// do POST /p sequentially
+int8_t irkit_httpclient_post_messages() {
+    if (is_posting_message) {
+        return -1;
+    }
+    int8_t cid = irkit_httpclient_post_messages_();
+    if (cid >= 0) {
+        is_posting_message = true; // this function is not called inside ISR; safe to set here
+    }
+    return cid;
 }
 
 int8_t irkit_httpclient_post_keys() {
@@ -451,6 +470,7 @@ void irkit_http_init() {
     irkit_httpserver_register_handler();
 
     polling_cid = CID_UNDEFINED;
+    is_posting_message = false;
 }
 
 void irkit_http_on_timer() {

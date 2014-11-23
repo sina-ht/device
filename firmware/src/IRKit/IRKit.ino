@@ -40,7 +40,6 @@ static FullColorLed color( FULLCOLOR_LED_R, FULLCOLOR_LED_G, FULLCOLOR_LED_B );
 struct RingBuffer commands;
 GSwifi gs(&Serial1X);
 Keys keys;
-unsigned long now;
 volatile char sharedbuffer[ SHARED_BUFFER_SIZE ];
 
 void setup() {
@@ -83,14 +82,11 @@ void setup() {
 
     pinMode(LDO33_ENABLE,     OUTPUT);
     wifi_hardware_reset();
-    irkit_http_init();
 
     // add your own code here!!
 }
 
 void loop() {
-    now = millis(); // always run first
-
     irkit_http_loop();
 
     if (TIMER_FIRED(reconnect_timer)) {
@@ -184,6 +180,7 @@ void process_commands() {
             irkit_httpclient_post_keys();
             break;
         case COMMAND_SETUP:
+            irkit_http_init();
             gs.setup( &on_disconnect, &on_reset );
 
             // vv continues
@@ -199,6 +196,13 @@ void process_commands() {
             break;
         case COMMAND_POST_DOOR:
             irkit_httpclient_post_door();
+            break;
+        case COMMAND_SETREGDOMAIN:
+            {
+                char regdomain;
+                ring_get( &commands, &regdomain, 1 );
+                gs.setRegDomain( regdomain );
+            }
             break;
         default:
             break;
@@ -221,10 +225,16 @@ void on_ir_receive() {
     IR_dump();
 #endif
     if (IR_packedlength() > 0) {
-        color.setLedColor( 0, 0, 1, true, 1 ); // received: blue blink for 1sec
-        irkit_httpclient_post_messages();
-        wait();
-        on_irkit_ready();
+        if (IR_looks_like_noise()) {
+            IRLOG_PRINTLN("!E31");
+            return;
+        }
+        int8_t cid = irkit_httpclient_post_messages();
+        if (cid >= 0) {
+            color.setLedColor( 0, 0, 1, true, 1 ); // received: blue blink for 1sec
+	    wait();
+            on_irkit_ready();
+        }
     }
 }
 
@@ -280,7 +290,7 @@ void connect() {
         keys.save();
 
         // start http server
-        gs.listen(80);
+        gs.listen();
     }
 
     if (gs.isListening()) {
@@ -309,7 +319,7 @@ void connect() {
             color.setLedColor( 1, 0, 0, true ); // red blink: listening for POST /wifi
             gs.startLimitedAP();
             if (gs.isLimitedAP()) {
-                gs.listen(80);
+                gs.listen();
             }
         }
     }

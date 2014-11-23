@@ -33,7 +33,6 @@
 #define CID_UNDEFINED     0xFF
 
 // nginx took 499
-#define HTTP_STATUSCODE_CLIENT_TIMEOUT 498
 #define HTTP_STATUSCODE_DISCONNECT     497
 
 /**
@@ -135,7 +134,7 @@ public:
     int8_t join (GSSECURITY sec, const char *ssid, const char *pass, int dhcp = 1, char *name = NULL);
     bool isJoined ();
 
-    int listen (uint16_t port);
+    int listen (); // always listen on 80
     bool isListening ();
 
     int8_t startLimitedAP ();
@@ -185,10 +184,7 @@ public:
     bool bufferEmpty();
     char bufferGet();
 
-    void loadLimitedAPPassword(char *);
-
 #ifdef FACTORY_CHECKER
-    void saveLimitedAPPassword(const char *);
     int8_t factorySetup(uint32_t initial_baud);
     int8_t checkVersion();
     const char* appVersion();

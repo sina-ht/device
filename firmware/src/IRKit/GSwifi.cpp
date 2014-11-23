@@ -37,8 +37,11 @@
 #include <avr/eeprom.h>
 #include "const.h"
 #include "env.h"
+#include "commands.h"
 
 extern void software_reset();
+extern void wifi_hardware_reset();
+extern struct RingBuffer commands;
 
 #define RESPONSE_LINES_ENDED -1
 
@@ -48,6 +51,7 @@ extern void software_reset();
 #define NEXT_TOKEN_LENGTH 3
 #define NEXT_TOKEN_DATA   4
 
+// memory is corruputed or something terrible that only AVR reset can rescue us
 #define ASSERT(a) if (!(a)) { software_reset(); }
 
 static char __buf_cmd[GS_CMD_SIZE + 1];
@@ -93,6 +97,14 @@ int8_t GSwifi::setup(GSEventHandler on_disconnect, GSEventHandler on_reset) {
         return -1;
     }
 
+    // disable external PA
+    // we might be connected to GS1011MIPS or GS1011MEPS
+    command(PB("AT+EXTPA=0",1), GSCOMMANDMODE_NORMAL);
+    delay( 100 );
+
+    // explicitly set transmit power
+    command(PB("AT+WP=0",1), GSCOMMANDMODE_NORMAL);
+
     // write this before AT&K1, cert includes XON or XOFF hex
     writeCert();
 
@@ -130,7 +142,7 @@ int8_t GSwifi::setupMDNS() {
     cmd[22] = ',';
     command(cmd, GSCOMMANDMODE_MDNS);
 
-    cmd = "AT+MDNSSRVREG=IRKitXXXX,,_irkit,_tcp,local,80";
+    cmd = PB("AT+MDNSSRVREG=IRKitXXXX,,_irkit,_tcp,local,80",1);
     strcpy( cmd+14, hostname() );
     cmd[23] = ',';
     command(cmd, GSCOMMANDMODE_MDNS);
@@ -142,19 +154,7 @@ int8_t GSwifi::setupMDNS() {
     return 0;
 }
 
-void GSwifi::loadLimitedAPPassword( char *password ) {
-    eeprom_read_block( (void*)password,
-                       (void*)EEPROM_LIMITEDAPPASSWORD_OFFSET,
-                       EEPROM_LIMITEDAPPASSWORD_LENGTH );
-}
-
 #ifdef FACTORY_CHECKER
-
-void GSwifi::saveLimitedAPPassword( const char *password ) {
-    eeprom_write_block( password,
-                        (void*)EEPROM_LIMITEDAPPASSWORD_OFFSET,
-                        EEPROM_LIMITEDAPPASSWORD_LENGTH );
-}
 
 int8_t GSwifi::factorySetup(uint32_t initial_baud) {
     clear();
@@ -206,6 +206,7 @@ const char *GSwifi::wlanVersion() {
 
 #endif // FACTORY_CHECKER
 
+// does recurse
 int8_t GSwifi::close (int8_t cid) {
     char *cmd = PB("AT+NCLOSE=0", 1);
     cmd[ 10 ] = i2x(cid);
@@ -245,7 +246,10 @@ void GSwifi::loop() {
 
             GSLOG_PRINT("!E4 "); GSLOG_PRINTLN(i);
 
-            dispatchResponseHandler(i, HTTP_STATUSCODE_CLIENT_TIMEOUT, GSREQUESTSTATE_ERROR);
+            // request (from us) timeout means GS is in trouble,
+            // and it's easy to just rescue ourselves to reset
+            wifi_hardware_reset();
+            return;
         }
     }
 }
@@ -258,6 +262,7 @@ void GSwifi::reset () {
 void GSwifi::parseByte(uint8_t dat) {
     static uint8_t  next_token; // split each byte into tokens (cid,ip,port,length,data)
     static bool     escape = false;
+    char temp[GS_MAX_PATH_LENGTH+1];
 
     if (dat == ESCAPE) {
         // 0x1B : Escape
@@ -359,13 +364,13 @@ void GSwifi::parseByte(uint8_t dat) {
                 }
                 else {
                     // end of request line
-                    char    method_chars[8];
-                    uint8_t method_size = 7;
-                    char    path[ GS_MAX_PATH_LENGTH + 1 ];
-                    uint8_t path_size   = GS_MAX_PATH_LENGTH;
-                    int8_t  result      = parseRequestLine((char*)method_chars, method_size);
+
+                    // reuse "temp" buffer to parse method and path
+                    int8_t  result  = parseRequestLine((char*)temp, 7);
+                    GSMETHOD method = GSMETHOD_UNKNOWN;
                     if ( result == 0 ) {
-                        result = parseRequestLine((char*)path, path_size);
+                        method = x2method(temp);
+                        result = parseRequestLine((char*)temp, GS_MAX_PATH_LENGTH);
                     }
                     if ( result != 0 ) {
                         // couldn't detect method or path
@@ -374,9 +379,8 @@ void GSwifi::parseByte(uint8_t dat) {
                         ring_clear(_buf_cmd);
                         break;
                     }
-                    GSMETHOD method = x2method(method_chars);
 
-                    routeid = router(method, path);
+                    routeid = router(method, temp);
                     if ( routeid < 0 ) {
                         request_state = GSREQUESTSTATE_ERROR;
                         error_code    = 404;
@@ -420,7 +424,8 @@ void GSwifi::parseByte(uint8_t dat) {
                 if ( request_state == GSREQUESTSTATE_ERROR ) {
                     writeHead( current_cid, error_code );
                     writeEnd();
-                    close( current_cid );
+                    ring_put( &commands, COMMAND_CLOSE );
+                    ring_put( &commands, current_cid );
                 }
                 else {
                     if (content_lengths_[ current_cid ] == 0) {
@@ -450,14 +455,13 @@ void GSwifi::parseByte(uint8_t dat) {
                     uint8_t i=0;
 
                     // skip 9 characters "HTTP/1.1 "
-                    char trash;
                     while (i++ < 9) {
-                        ring_get( _buf_cmd, &trash, 1 );
+                        ring_get( _buf_cmd, &temp[0], 1 );
                     }
 
-                    char status_code_chars[4];
-                    status_code_chars[ 3 ] = 0;
-                    int8_t count = ring_get( _buf_cmd, status_code_chars, 3 );
+                    // copy 3 numbers representing status code into temp buffer
+                    temp[ 3 ] = 0;
+                    int8_t count = ring_get( _buf_cmd, temp, 3 );
                     if (count != 3) {
                         // protocol error
                         // we should receive something like: "200 OK", "401 Unauthorized"
@@ -465,7 +469,7 @@ void GSwifi::parseByte(uint8_t dat) {
                         request_state = GSREQUESTSTATE_ERROR;
                         break;
                     }
-                    status_code                     = atoi(status_code_chars);
+                    status_code                     = atoi(temp);
                     request_state                   = GSREQUESTSTATE_HEAD2;
                     continuous_newlines_            = 0;
                     content_lengths_[ current_cid ] = 0;
@@ -629,6 +633,7 @@ inline void GSwifi::setCidIsRequest(int8_t cid, bool is_request) {
     }
 }
 
+// request against us
 inline bool GSwifi::cidIsRequest(int8_t cid) {
     return cid_bitmap_ & _BV(cid);
 }
@@ -711,7 +716,7 @@ GSwifi::GSMETHOD GSwifi::x2method(const char *method) {
 }
 
 void GSwifi::parseLine () {
-    char buf[GS_CMD_SIZE];
+    static char buf[GS_CMD_SIZE];
 
     while (! ring_isempty(_buf_cmd)) {
         // received "\n"
@@ -742,7 +747,7 @@ void GSwifi::parseLine () {
             int8_t cid = x2i(buf[10]); // 2nd cid = HTTP client cid
             ASSERT((0 <= cid) && (cid <= 16));
 
-            setCidIsRequest(cid, true); // request against us
+            setCidIsRequest(cid, true);
             content_lengths_[ cid ] = 0;
 
             // don't close other connections,
@@ -818,7 +823,7 @@ void GSwifi::parseCmdResponse (char *buf) {
 
             // don't close other connections,
             // other connections close theirselves on their turn
-            
+
             TIMER_STOP(timers_[cid]);
             connected_cid_ = cid;
         }
@@ -1068,12 +1073,8 @@ int8_t GSwifi::join (GSSECURITY sec, const char *ssid, const char *pass, int dhc
     return 0;
 }
 
-int GSwifi::listen(uint16_t port) {
-    char cmd[15];
-
-    // longest: "AT+NSTCP=65535"
-    sprintf(cmd, P("AT+NSTCP=%d"), port);
-    command(cmd, GSCOMMANDMODE_CONNECT);
+int GSwifi::listen() {
+    command(PB("AT+NSTCP=80",1), GSCOMMANDMODE_CONNECT);
     if (did_timeout_) {
         return -1;
     }
@@ -1091,11 +1092,10 @@ int8_t GSwifi::startLimitedAP () {
 
     command(PB("AT+NSET=192.168.1.1,255.255.255.0,192.168.1.1",1), GSCOMMANDMODE_NORMAL);
 
-    // AT+WPAPSK=IRKitXXXX,0123456789
-    cmd = PB("AT+WPAPSK=%,%",1);
+    // password area overwritten in factory
+    cmd = PB("AT+WPAPSK=IRKitXXXX,XXXXXXXXXX",1);
     strcpy( cmd+10, hostname() );
     cmd[19] = ',';
-    loadLimitedAPPassword( cmd + 20 );
     command(cmd, GSCOMMANDMODE_NORMAL, GS_TIMEOUT_LONG);
 
     // WPA2
@@ -1173,6 +1173,13 @@ int8_t GSwifi::setBaud (uint32_t baud) {
 #endif
 
 int8_t GSwifi::setRegDomain (char regdomain) {
+
+#if WIFI_MODULE == GS1011MEPS
+    if (regdomain == 1) {
+        regdomain = 3;
+    }
+#endif
+
     char *cmd = PB("AT+WREGDOMAIN=%",1);
     cmd[ 14 ] = regdomain;
     command(cmd, GSCOMMANDMODE_NORMAL);
@@ -1181,15 +1188,14 @@ int8_t GSwifi::setRegDomain (char regdomain) {
 
 // returns -1 on error, >0 on success
 int8_t GSwifi::request(GSwifi::GSMETHOD method, const char *path, const char *body, uint16_t length, GSwifi::GSResponseHandler handler, uint8_t timeout, uint8_t is_binary) {
-    char cmd[ GS_CMD_SIZE ];
-    char *cmd2;
+    char *cmd;
 
 #ifdef TESTER
     // Tester only requests against limited AP test target
     // DNSLOOKUP should fail, because it's in limitedAP mode, ignore it.
     sprintf( ipaddr_, "%s", "192.168.1.1" );
 #else
-    sprintf(cmd, P("AT+DNSLOOKUP=%s"), DOMAIN);
+    cmd = PB("AT+DNSLOOKUP=" DOMAIN,1);
     command(cmd, GSCOMMANDMODE_DNSLOOKUP);
 #endif
 
@@ -1205,10 +1211,12 @@ int8_t GSwifi::request(GSwifi::GSMETHOD method, const char *path, const char *bo
         return -1;
     }
 
+    cmd = PB("AT+NCTCP=",1);
+    strcpy( cmd+9, ipaddr_ );
 #ifdef TESTER
-    sprintf(cmd, P("AT+NCTCP=%s,80"), ipaddr_);
+    strcpy( cmd+9+strlen(ipaddr_), ",80");
 #else
-    sprintf(cmd, P("AT+NCTCP=%s,443"), ipaddr_);
+    strcpy( cmd+9+strlen(ipaddr_), ",443");
 #endif
 
     connected_cid_ = CID_UNDEFINED;
@@ -1229,9 +1237,9 @@ int8_t GSwifi::request(GSwifi::GSMETHOD method, const char *path, const char *bo
     handlers_[ cid ] = handler;
 
 #ifndef TESTER
-    cmd2 = PB("AT+SSLOPEN=%,cacert",1);
-    cmd2[ 11 ] = xid;
-    command(cmd2, GSCOMMANDMODE_NORMAL);
+    cmd = PB("AT+SSLOPEN=%,cacert",1);
+    cmd[ 11 ] = xid;
+    command(cmd, GSCOMMANDMODE_NORMAL);
 #endif
 
     // disable TCP_MAXRT and TCP_KEEPALIVE_X, because these commands takes some time to issue,
@@ -1241,35 +1249,35 @@ int8_t GSwifi::request(GSwifi::GSMETHOD method, const char *path, const char *bo
 
     // TCP_MAXRT = 10
     // AT+SETSOCKOPT=0,6,10,10,4
-    // cmd2 = PB("AT+SETSOCKOPT=%,6,10,10,4",1);
-    // cmd2[ 14 ] = xid;
-    // command(cmd2, GSCOMMANDMODE_NORMAL);
+    // cmd = PB("AT+SETSOCKOPT=%,6,10,10,4",1);
+    // cmd[ 14 ] = xid;
+    // command(cmd, GSCOMMANDMODE_NORMAL);
 
     // Enable TCP_KEEPALIVE on this socket
     // AT+SETSOCKOPT=0,65535,8,1,4
-    // cmd2 = PB("AT+SETSOCKOPT=%,65535,8,1,4",1);
-    // cmd2[ 14 ] = xid;
-    // command(cmd2, GSCOMMANDMODE_NORMAL);
+    // cmd = PB("AT+SETSOCKOPT=%,65535,8,1,4",1);
+    // cmd[ 14 ] = xid;
+    // command(cmd, GSCOMMANDMODE_NORMAL);
 
     // TCP_KEEPALIVE_PROBES = 2
     // AT+SETSOCKOPT=0,6,4005,2,4
-    // cmd2 = PB("AT+SETSOCKOPT=%,6,4005,2,4",1);
-    // cmd2[ 14 ] = xid;
-    // command(cmd2, GSCOMMANDMODE_NORMAL);
+    // cmd = PB("AT+SETSOCKOPT=%,6,4005,2,4",1);
+    // cmd[ 14 ] = xid;
+    // command(cmd, GSCOMMANDMODE_NORMAL);
 
     // TCP_KEEPALIVE_INTVL = 150
     // AT+SETSOCKOPT=0,6,4001,150,4
     // mysteriously, GS1011MIPS denies with "ERROR: INVALID INPUT" for seconds less than 150
-    // cmd2 = PB("AT+SETSOCKOPT=%,6,4001,150,4",1);
-    // cmd2[ 14 ] = xid;
-    // command(cmd2, GSCOMMANDMODE_NORMAL);
+    // cmd = PB("AT+SETSOCKOPT=%,6,4001,150,4",1);
+    // cmd[ 14 ] = xid;
+    // command(cmd, GSCOMMANDMODE_NORMAL);
     // if (did_timeout_) {
     //     return -1;
     // }
 
-    cmd2 = PB("S0",1);
-    cmd2[ 1 ]  = xid;
-    escape( cmd2 );
+    cmd = PB("S0",1);
+    cmd[ 1 ]  = xid;
+    escape( cmd );
 
     if (method == GSMETHOD_POST) {
         serial_->print(P("POST "));
@@ -1321,7 +1329,9 @@ int8_t GSwifi::postBinary(const char *path, const char *body, uint16_t length, G
 }
 
 char* GSwifi::hostname() {
-    char *ret = PB("IRKit%%%%", 2);
+    // reuse index: 0 area
+    // this should be safe if we immediately call `strcpy( target, hostname() )`
+    char *ret = PB("IRKit%%%%", 0);
     ret[ 5 ] = mac_[12];
     ret[ 6 ] = mac_[13];
     ret[ 7 ] = mac_[15];

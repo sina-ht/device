@@ -39,6 +39,7 @@ typedef struct _irstruct {
     uint8_t           freq;     // carrier wave freq in kHz
     uint8_t           xmit_timer; // xmit timeout timer
     uint8_t           recv_timer; // recv timeout timer
+    uint8_t           looks_like_noise; // data range looks like noise
     IRReceiveCallback on_receive;
     uint16_t          len;      // Size of buff used
     uint16_t          tx_index; // 0 < tx_index < len
@@ -62,6 +63,7 @@ extern uint16_t IR_get ();
 extern void IR_put (uint16_t);
 extern uint16_t IR_packedlength (void);
 extern uint16_t IR_rawlength (void);
+extern uint8_t IR_looks_like_noise (void);
 extern void IR_timer (void);
 extern void IR_loop (void);
 extern void IR_state (uint8_t);
