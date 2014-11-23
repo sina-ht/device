@@ -1,4 +1,6 @@
 IRKit Device
+
+Firmware has been modified by sina_ht (Less LED annoyance)
 ===
 
 IRKit device and [IRKit SDK](https://github.com/irkit/ios-sdk) lets you control your home electronics from your iOS devices.
@@ -172,4 +174,3 @@ See details in [hardware/LICENSE](https://github.com/irkit/device/blob/master/ha
 
 Case is licensed under Creative Commons Attribution NonCommercial Share-Alike license.  
 See details in [case/LICENSE](https://github.com/irkit/device/blob/master/case/LICENSE).
-
